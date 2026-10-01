@@ -1,0 +1,10 @@
+FROM tensorfold-qwen38:v0.3.6.3
+ARG PATCHES_HASH
+COPY patches/0009-cooperative-prefill.patch /opt/prefill-yield.patch
+COPY spark/test_prefill_yield.py /opt/test_prefill_yield.py
+RUN cd /usr/local/lib/python3.12/dist-packages && patch -p0 --forward < /opt/prefill-yield.patch && \
+    python /opt/test_prefill_yield.py --installed && \
+    python -m compileall -q tensorfold/cuda/scheduler.py tensorfold/families/qwen4_exp/cuda/multi.py \
+        tensorfold/families/qwen4_exp/cuda/decode.py
+LABEL tf.patches=${PATCHES_HASH}
+LABEL spark.prefill_scheduling="decode-between-committed-chunks"

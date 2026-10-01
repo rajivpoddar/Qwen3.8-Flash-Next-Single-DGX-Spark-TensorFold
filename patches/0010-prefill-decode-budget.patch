@@ -1,0 +1,91 @@
+--- tensorfold/cuda/scheduler.py
++++ tensorfold/cuda/scheduler.py
+@@ -2,17 +2,27 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import queue
+ import threading
++import time
+ from typing import Any, Callable
+ 
+ from .streams import Stream
+ 
+ 
++def _decode_share() -> float:
++    share = float(os.environ.get("TENSORFOLD_PREFILL_DECODE_SHARE", "0.20"))
++    if not 0 <= share <= 0.5:
++        raise ValueError("TENSORFOLD_PREFILL_DECODE_SHARE must be finite and between 0 and 0.5")
++    return share
++
++
+ class Scheduler:
+     def __init__(self, decoder: Any, *, max_streams: int = 4) -> None:
+         self.decoder = decoder
+         self.max_streams = max_streams
++        self.decode_share = _decode_share()
+         self.waiting: queue.Queue = queue.Queue()
+         self.boxes: dict[int, queue.Queue] = {}
+         self.thread = threading.Thread(target=self._loop, daemon=True)
+@@ -71,17 +81,29 @@
+         for s in done:
+             self._reply(s, *(("error", s.error) if s.error is not None else ("done", s.stats())))
+ 
+-    def _decode_between_chunks(self) -> None:
+-        """Advance only admitted streams: no recursive admission or second prefill buffer owner."""
++    def _decode_between_chunks(self, prefill_s: float) -> None:
++        """Bounded decode burst; never recursively admit or borrow the prefill scratch buffer.
+ 
+-        try:
+-            done = self.decoder.round()
+-        except Exception as exc:
+-            for s in self.decoder.drop():
+-                self._reply(s, "error", exc)
+-            raise                                  # also abort the partial admission; its state is released
+-        self._finish(done)
++        A share of .20 means decode gets .25 times the preceding chunk's duration.
++        Keep the prior one-round minimum; cap extra work at .5 seconds or 32 rounds.
++        Zero restores the original one-round yield for a quick scheduling rollback.
++        """
+ 
++        if not self.decoder.live():
++            return
++        budget = min(0.5, max(0.0, prefill_s) * self.decode_share / (1 - self.decode_share))
++        deadline = time.monotonic() + budget
++        for _ in range(32):
++            try:
++                done = self.decoder.round()
++            except Exception as exc:
++                for s in self.decoder.drop():
++                    self._reply(s, "error", exc)
++                raise                              # also abort the partial admission; release its state
++            self._finish(done)
++            if not self.decoder.live() or time.monotonic() >= deadline:
++                break
++
+     def _loop(self) -> None:
+         while True:
+             done = self._admit(None if self.decoder.live() else self.waiting.get())   # idle: wait for a request
+--- tensorfold/families/qwen4_exp/cuda/decode.py
++++ tensorfold/families/qwen4_exp/cuda/decode.py
+@@ -287,6 +287,7 @@
+     w, st, pb = e.w, e.st, e.pbuf
+     last = None
+     for start in range(begin, len(prompt), e.prefill_rows):
++        chunk_started = time.monotonic() if on_chunk is not None else 0.0
+         chunk = list(prompt[start:start + e.prefill_rows])
+         R = len(chunk)
+         final = start + R >= len(prompt)
+@@ -318,7 +319,10 @@
+         if not final and on_chunk is not None:
+             # The KV/MTP state is committed and every retained scratch row has been cloned.
+             # Decode owns buf/mbuf, not pbuf; never admit another prompt from this callback.
+-            on_chunk()
++            # CUDA is asynchronous: include completed GPU work, not just kernel-launch time.
++            # No added synchronization on the standalone prefill/warmup path.
++            torch.cuda.synchronize()
++            on_chunk(time.monotonic() - chunk_started)
+     if vision is not None:                           # decode continues at the image prompt's rotary offset
+         st.set_rope_delta(vision.rope_delta)
+     first = e.sample(last, [len(prompt)], sampling)[0]

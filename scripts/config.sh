@@ -8,21 +8,21 @@ MODEL_ID="${MODEL_ID:-Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}"   # MLX 4-bit, gr
 TF_VERSION="${TF_VERSION:-v0.3.6.3}"
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
-IMAGE="${IMAGE:-tensorfold-qwen38:${TF_VERSION}}"                 # the local image prepare.sh builds or pulls
+IMAGE="${IMAGE:-tensorfold-qwen38:${TF_VERSION}-prefix-retention}"   # local fork: patches 0001-0011
 CONTAINER_NAME="${CONTAINER_NAME:-qwen38-flash-next-tf}"          # the server's container
 # The prebuilt image: prepare.sh pulls $GHCR_IMAGE:<TF_VERSION>-<patches hash>; publish-image.sh pushes it.
 GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold}"
 
-SERVED_NAME="${SERVED_NAME:-Qwen3.8-Flash-Next}"   # the model id clients see in /v1/models and replies (tensorfold --name)
-HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-8888}"
+SERVED_NAME="${SERVED_NAME:-qwen3.8-flash-next}"   # preserve the existing Spark client model alias
+HOST="${HOST:-127.0.0.1}"                           # TensorFold is private behind the Anthropic-compatible gateway
+PORT="${PORT:-8888}"                                 # internal TensorFold port; clients stay on public port 30000
 # Serving defaults (./start.sh arguments come after them and win). All streams share one memory pool (~103-104 GiB
 # budget on a 128 GB Spark, 75 GiB of it weights), so window x streams x KV bytes must fit: 4 streams x 262,144 tokens
 # at int8 KV is ~97.8 GiB, 5 streams ~102.6 GiB (~4.5 GiB a stream). Other fits: 3 streams bf16 at 262k, 6 streams
 # int4 at 262k, 8 streams int4 at ~250k (tight), 6 streams int8 at ~220k. int4 and bf16 KV change the output slightly.
-PARALLEL="${PARALLEL:-5}"          # requests decoded together (streams)
+PARALLEL="${PARALLEL:-4}"          # approved Spark deployment: four concurrent streams
 CONTEXT="${CONTEXT:-262144}"       # prompt + reply window per stream (the model's native maximum)
-KV_DTYPE="${KV_DTYPE:-int8}"       # bf16 | int8 | int4
+KV_DTYPE="${KV_DTYPE:-int4}"       # approved memory fit; preserves the full 262K context per stream
 PLE_ON_SSD="${PLE_ON_SSD:-1}"      # 1: read the 29.8 GiB n-gram tables from SSD, leaving that RAM to the KV cache
 # Image and video input (patch 0008): the model's own vision tower, 0.84 GiB. Its ~0.8 GiB of scratch is taken only
 # while an image or video encodes and handed back right after, so startup reserves none for it; 2,048-row prompt
@@ -48,6 +48,9 @@ THINKING="${THINKING:-1}"
 # room the vision tower takes: 2,048 with VISION=1, 4,096 without.
 if [[ "$VISION" == 1 ]]; then _rows=2048; else _rows=4096; fi
 export TENSORFOLD_PREFILL_ROWS="${TENSORFOLD_PREFILL_ROWS:-$_rows}"
+# Decode share between committed prefill chunks (patch 0010). 0 restores one round per chunk.
+# .20 reserves ~20% of each chunk/decode cycle, capped at .5s extra decode per chunk.
+export TENSORFOLD_PREFILL_DECODE_SHARE="${TENSORFOLD_PREFILL_DECODE_SHARE:-0.20}"
 # What startup reserves for the vision tower's scratch (MiB); 0: it comes from the system reserve while it encodes.
 export TENSORFOLD_VISION_WORKSPACE_MIB="${TENSORFOLD_VISION_WORKSPACE_MIB:-0}"
 # The whole video's token budget (Qwen3-VL's per-frame sizing; 2 frames a second, at most 256 frames).

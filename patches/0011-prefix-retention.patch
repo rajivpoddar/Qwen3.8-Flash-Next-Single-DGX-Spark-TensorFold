@@ -1,0 +1,14 @@
+--- tensorfold/families/qwen4_exp/cuda/multi.py
++++ tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -133,7 +133,10 @@
+         e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity)
+         mtp = s.draft and self.depth > 0 and self.mbuf is not None
+-        prefix = None
++        # A tail-only resume emits no new nonfinal checkpoint. Keep its original
++        # reusable boundary rather than replacing it with the whole prompt;
++        # _slot_for deliberately requires at least one prompt token left over.
++        prefix = (s.cached, resume["state"], resume["tail"]) if resume is not None else None
+ 
+         def keep_prefix(length, tail):
+             nonlocal prefix
+             snap = st.snapshot()

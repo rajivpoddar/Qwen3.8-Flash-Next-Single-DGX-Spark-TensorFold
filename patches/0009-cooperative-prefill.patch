@@ -1,0 +1,140 @@
+--- tensorfold/cuda/scheduler.py
++++ tensorfold/cuda/scheduler.py
+@@ -49,7 +49,11 @@
+                     break
+             self.boxes[id(stream)] = box
+             try:
+-                self.decoder.admit(stream)
++                cooperative = getattr(self.decoder, "admit_cooperatively", None)
++                if cooperative is None:
++                    self.decoder.admit(stream)
++                else:
++                    cooperative(stream, self._decode_between_chunks)
+             except Exception as exc:                 # noqa: BLE001  (this request fails, the others go on)
+                 self.boxes.pop(id(stream)).put(("error", exc))
+                 continue
+@@ -62,6 +66,22 @@
+         if box is not None:
+             box.put((kind, value))
+ 
++    def _finish(self, done: list[Stream]) -> None:
++        self.decoder.finish(done)
++        for s in done:
++            self._reply(s, *(("error", s.error) if s.error is not None else ("done", s.stats())))
++
++    def _decode_between_chunks(self) -> None:
++        """Advance only admitted streams: no recursive admission or second prefill buffer owner."""
++
++        try:
++            done = self.decoder.round()
++        except Exception as exc:
++            for s in self.decoder.drop():
++                self._reply(s, "error", exc)
++            raise                                  # also abort the partial admission; its state is released
++        self._finish(done)
++
+     def _loop(self) -> None:
+         while True:
+             done = self._admit(None if self.decoder.live() else self.waiting.get())   # idle: wait for a request
+@@ -70,6 +90,4 @@
+             except Exception as exc:                 # noqa: BLE001  (the live requests fail)
+                 for s in self.decoder.drop():
+                     self._reply(s, "error", exc)
+-            self.decoder.finish(done)
+-            for s in done:
+-                self._reply(s, *(("error", s.error) if s.error is not None else ("done", s.stats())))
++            self._finish(done)
+--- tensorfold/families/qwen4_exp/cuda/multi.py
++++ tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -108,8 +108,13 @@
+         if all(f is not s.st for f in self.free):
+             self.free.append(s.st)
+ 
++    def admit_cooperatively(self, s: Stream, on_chunk) -> None:
++        """Decode existing streams between committed prefill chunks, on the same worker thread."""
++
++        self.admit(s, on_chunk=on_chunk)
++
+     @torch.no_grad()
+-    def admit(self, s: Stream) -> None:
++    def admit(self, s: Stream, *, on_chunk=None) -> None:
+         """Prefill a request in a free slot, draft its first chain and emit its first token."""
+ 
+         room = self.capacity - len(s.prompt) - self.depth - 1
+@@ -127,8 +132,20 @@
+         st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and not image)
+         e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity)
+         mtp = s.draft and self.depth > 0 and self.mbuf is not None
++        prefix = None
++
++        def keep_prefix(length, tail):
++            nonlocal prefix
++            snap = st.snapshot()
++            if mtp:
++                # A nonfinal chunk absorbed its successor token into MTP already.
++                # Exclude that position: the next request may have a different successor.
++                snap["mtp_len"] -= 1
++            prefix = (length, snap, tail.clone() if mtp else None)
++
+         try:
+-            first = prefill(e, s.prompt, s.sampling, mtp=mtp, resume=resume, vision=encoded)
++            first = prefill(e, s.prompt, s.sampling, mtp=mtp, resume=resume, vision=encoded,
++                            on_chunk=on_chunk, on_prefix=keep_prefix if s.draft and not image else None)
+         except Exception:
+             self.free.append(st)
+             raise
+@@ -144,7 +161,11 @@
+ 
+             s.copies = CopyIndex(COPY_MATCH)
+         if s.draft and not image:         # the prompt's state; the MTP head has absorbed every position but the last
+-            self._remember(list(s.prompt), st, st.snapshot(), e.last_streams.clone() if mtp else None)
++            if prefix is None:            # short prompts keep their original prompt-end cache behavior
++                self._remember(list(s.prompt), st, st.snapshot(), e.last_streams.clone() if mtp else None)
++            else:
++                length, snap, tail = prefix
++                self._remember(list(s.prompt[:length]), st, snap, tail)
+         s.context = list(s.prompt)
+         s.drafts = draft(e, e.last_streams, [first], st.pos + 1, min(self.depth, s.count - 1), s.sampling,
+                          self.confidence) if mtp and s.count > 1 else []
+--- tensorfold/families/qwen4_exp/cuda/decode.py
++++ tensorfold/families/qwen4_exp/cuda/decode.py
+@@ -245,7 +245,7 @@
+ 
+ @torch.no_grad()
+ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True,
+-            resume: dict | None = None, vision=None) -> int:
++            resume: dict | None = None, vision=None, on_chunk=None, on_prefix=None) -> int:
+     """Commit the prompt in chunks, sample the first token; rows ignore chunking, so ``resume`` equals a fresh run.
+     ``vision`` (``tensorfold.vision.qwen_cuda.EncodedVision``): the image rows take its features and every row its
+     t/h/w rotary positions; later text rotates at its position plus the prompt's offset."""
+@@ -277,12 +277,13 @@
+     try:
+         return _prefill_chunks(e, prompt, sampling, begin, history, use_mtp, vision,
+                                image_rows if vision is not None else None,
+-                               positions if vision is not None else None)
++                               positions if vision is not None else None, on_chunk, on_prefix)
+     finally:
+         pb.rope_rows = None
+ 
+ 
+-def _prefill_chunks(e, prompt, sampling, begin, history, use_mtp, vision, image_rows, positions) -> int:
++def _prefill_chunks(e, prompt, sampling, begin, history, use_mtp, vision, image_rows, positions,
++                    on_chunk=None, on_prefix=None) -> int:
+     w, st, pb = e.w, e.st, e.pbuf
+     last = None
+     for start in range(begin, len(prompt), e.prefill_rows):
+@@ -310,6 +311,14 @@
+                 mtp_forward(w, st, pb, nxt, pb.streams[:len(nxt)])
+                 st.set_mtp_len(st.mtp_len + len(nxt))
+         commit(w, st, pb, R, R)
++        if not final and on_prefix is not None and start + R + e.prefill_rows >= len(prompt):
++            # Keep one stable pre-generation boundary, not the final chat-template token:
++            # tokenization of that last token can change when a tool turn is appended.
++            on_prefix(start + R, streams_last)
++        if not final and on_chunk is not None:
++            # The KV/MTP state is committed and every retained scratch row has been cloned.
++            # Decode owns buf/mbuf, not pbuf; never admit another prompt from this callback.
++            on_chunk()
+     if vision is not None:                           # decode continues at the image prompt's rotary offset
+         st.set_rope_delta(vision.rope_delta)
+     first = e.sample(last, [len(prompt)], sampling)[0]

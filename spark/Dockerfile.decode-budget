@@ -1,0 +1,9 @@
+FROM tensorfold-qwen38:v0.3.6.3-prefill-yield
+ARG PATCHES_HASH
+COPY patches/0010-prefill-decode-budget.patch /opt/prefill-decode-budget.patch
+COPY spark/test_prefill_yield.py /opt/test_prefill_yield.py
+RUN cd /usr/local/lib/python3.12/dist-packages && patch --fuzz=0 -p0 --forward < /opt/prefill-decode-budget.patch && \
+    python /opt/test_prefill_yield.py --installed && \
+    python -m compileall -q tensorfold/cuda/scheduler.py tensorfold/families/qwen4_exp/cuda/decode.py
+LABEL tf.patches=${PATCHES_HASH}
+LABEL spark.prefill_scheduling="bounded-decode-share"

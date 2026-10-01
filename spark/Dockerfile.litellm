@@ -1,0 +1,4 @@
+FROM ghcr.io/berriai/litellm:v1.93.0
+COPY spark/patch_litellm_stream.py spark/test_litellm_stream.py /tmp/spark-stream-patch/
+RUN python /tmp/spark-stream-patch/patch_litellm_stream.py \
+    && python /tmp/spark-stream-patch/test_litellm_stream.py

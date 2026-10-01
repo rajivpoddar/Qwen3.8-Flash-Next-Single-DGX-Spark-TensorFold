@@ -1,0 +1,10 @@
+FROM tensorfold-qwen38:v0.3.6.3-decode-budget
+ARG PATCHES_HASH
+COPY patches/0011-prefix-retention.patch /opt/spark/0011-prefix-retention.patch
+COPY spark/test_prefill_yield.py /opt/spark/test_prefill_yield.py
+RUN cd /usr/local/lib/python3.12/dist-packages && \
+    patch --fuzz=0 -p0 --forward < /opt/spark/0011-prefix-retention.patch && \
+    python /opt/spark/test_prefill_yield.py --installed && \
+    python -m compileall -q tensorfold/families/qwen4_exp/cuda/multi.py
+LABEL tf.patches=${PATCHES_HASH}
+LABEL spark.prefix_retention="reuse-tail-checkpoint"

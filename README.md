@@ -7,6 +7,13 @@
   <a href="https://x.com/MiaAI_lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Follow%20me%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow Mia on X" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
 </p>
 
+> **Rajiv's Spark port-30000 fork:** this checkout keeps the client alias
+> `qwen3.8-flash-next` and serves clients through the Anthropic-compatible
+> gateway on port 30000. TensorFold itself is private on 127.0.0.1:8888.
+> Use [spark/README.md](spark/README.md) for preparation, same-port cutover,
+> dashboard integration and rollback. The upstream benchmarks below measure
+> TensorFold directly; they do not include gateway overhead.
+
 Serve **Qwen3.8 Flash Next** from a single NVIDIA DGX Spark (GB10, 128 GB) through an OpenAI-compatible API, with
 **5 concurrent requests at the full 262,144-token context** and **image and video input**. It runs
 [TensorFold](https://github.com/ashhart/TensorFold) v0.3.6.3 in NVIDIA's PyTorch container, plus a small set of
@@ -15,10 +22,12 @@ model its own vision tower on CUDA.
 
 - Checkpoint: [`Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`](https://huggingface.co/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP)
   (MLX 4-bit, group size 32, with the MTP draft head)
-- API model id: `Qwen3.8-Flash-Next`
+- API model id in this fork: `qwen3.8-flash-next`
 - KV pool: **1,310,720 tokens** (5 streams x 262,144, int8 KV cache, ~23.4 GiB), 25% more than 4 streams
 - Images and videos in chat messages (`image_url` / `video_url` parts), see [Images and video](#images-and-video)
-- One command: `./start.sh` sets everything up on the first run and starts the server; `./stop.sh` stops it
+- `./start.sh` starts only the private TensorFold backend in this fork. Use
+  `spark/start-stack.sh` for the client-facing gateway after preparation and
+  draining the current port-30000 service.
 
 ## Performance
 

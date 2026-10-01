@@ -1,0 +1,17 @@
+model_list:
+  - model_name: qwen3.8-flash-next
+    litellm_params:
+      # TensorFold implements chat/completions, not the OpenAI Responses API.
+      # hosted_vllm selects LiteLLM's Anthropic-to-chat compatibility adapter.
+      model: hosted_vllm/qwen3.8-flash-next
+      api_base: http://127.0.0.1:8888/v1
+      api_key: none
+
+litellm_settings:
+  callbacks:
+    - prometheus
+  request_timeout: 1200
+  set_verbose: false
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

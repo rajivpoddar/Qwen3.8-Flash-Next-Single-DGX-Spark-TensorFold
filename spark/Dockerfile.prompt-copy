@@ -1,0 +1,11 @@
+FROM tensorfold-spark:v0.6.0-victoria-v3
+ARG PATCH_SHA256
+COPY spark/patches/tf060-prompt-copy.patch /opt/spark/tf060-prompt-copy.patch
+COPY spark/test_prompt_copy.py /opt/spark/test_prompt_copy.py
+RUN test "$(sha256sum /opt/spark/tf060-prompt-copy.patch | cut -d' ' -f1)" = "$PATCH_SHA256" && \
+    cd /usr/local/lib/python3.12/dist-packages && \
+    patch --fuzz=0 -p1 --forward < /opt/spark/tf060-prompt-copy.patch && \
+    python /opt/spark/test_prompt_copy.py --installed && \
+    python -m compileall -q tensorfold/cuda/streams.py tensorfold/families/qwen4_exp/cuda/multi.py
+LABEL spark.prompt_copy="flash-next-tf060-verified-v1"
+LABEL spark.prompt_copy_patch=${PATCH_SHA256}

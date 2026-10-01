@@ -41,6 +41,37 @@ two telemetry containers if proof fails.
 
 ## Preparation and cutover
 
+### TensorFold 0.6.0 prompt-copy drafting (Victoria NVFP4)
+
+`spark/patches/tf060-prompt-copy.patch` ports Mia's patch 0007 to the 0.6.0
+concurrent decoder. It consumes `TENSORFOLD_MTP_COPY=1`, which the unpatched
+0.6.0 build ignores. MTP first absorbs the accepted rows; an eight-token
+suffix match with a backed continuation then proposes at most the configured
+draft depth and remaining reply room. The target verifier, sampling, grammar,
+EOS handling, prefix cache, prefill scheduling and model weights are unchanged.
+No match falls back to MTP. Mixed copy/MTP rounds select the correct per-stream
+logit rows after excluding copied streams. Temporary pending tokens are always
+removed from the request context, even if lookup fails.
+
+Each copied request reports `copy_drafted` (copied rows actually verified) and
+`copy_accepted` in its existing `tensorfold` stats. Serial requests never use
+lookup. `spark/test_prompt_copy.py` runs twelve CPU control-flow tests against
+the actual installed sources. `spark/prove_prompt_copy.py` checks four concurrent
+greedy/sampled quoting and novel-output requests, baseline token hashes, copied
+acceptance and the uncached serial reference. It does not claim a universal
+throughput improvement; Mia's older MLX recipe reports a quoting/editing benefit.
+
+Build `spark/Dockerfile.prompt-copy` only after checking its base image is
+`sha256:2c318ce3dd7fdee5d1fac9d684382f5ecd444d2c3aefd7484aba7af5ac4f3f4b`.
+Pass the patch SHA256 as `PATCH_SHA256`. Replace only the backend in a separately
+named container and preserve the stopped source for rollback. Keep the existing
+route/auth/alias, 262144 context, four streams, INT4 KV, MTP3/confidence .60 and
+decode share .20. Do not replay the older 0.3.x maintenance scripts over this
+0.6.0 container. Resume only previously active clients, sequentially, in their
+existing conversations after authenticated Anthropic streaming/tool proof.
+
+Source: [Mia's prompt-copy patch](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/main/patches/0007-flash-next-copy-drafts.patch).
+
 ### Retaining a reusable prefix after warm requests
 
 Patch `0011` keeps the original nonfinal snapshot when a resumed prompt has

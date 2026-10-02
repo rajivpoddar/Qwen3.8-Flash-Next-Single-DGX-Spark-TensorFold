@@ -12,7 +12,7 @@ source scripts/config.sh
 CLIENT_KEY_FILE="${CLIENT_KEY_FILE:-/home/user/.config/ornith15/api-key}"
 GATEWAY_STATE_DIR="${GATEWAY_STATE_DIR:-$HOME/.config/tensorfold-gateway}"
 INTERNAL_KEY_FILE="${INTERNAL_KEY_FILE:-$GATEWAY_STATE_DIR/internal-key}"
-LITELLM_IMAGE="${LITELLM_IMAGE:-spark-tf-litellm:v1.93.0-reasoning-split}"
+CLIPROXY_IMAGE="${CLIPROXY_IMAGE:-spark-tf-cliproxy:v8.0.10}"
 NGINX_IMAGE="${NGINX_IMAGE:-nginx:1.27-alpine}"
 PYTHON_IMAGE="${PYTHON_IMAGE:-python:3.11-alpine}"
 
@@ -29,12 +29,12 @@ dashboard_url=$(printf '%s\n' "$dashboard_env" | sed -n 's/^SPARK_DASHBOARD_ENGI
 [[ "$dashboard_key" == "$CLIENT_KEY" && "$dashboard_engine" == vllm && "$dashboard_url" == *:30000 ]] ||
   die "dashboard engine, URL or key differs from this gateway; reconcile it before the source is stopped"
 [[ -z "$(ss -ltn 'sport = :30000' | sed -n '2p')" ]] || die "port 30000 is still occupied; no source service was stopped"
-for name in qwen38-flash-next-tf spark-tf-litellm spark-tf-metrics spark-tf-gateway; do
+for name in qwen38-flash-next-tf spark-tf-litellm spark-tf-cliproxy spark-tf-metrics spark-tf-gateway; do
   docker inspect "$name" >/dev/null 2>&1 &&
     die "$name already exists; inspect and remove that exact stopped container before another start"
 done
 # shellcheck disable=SC2153 # IMAGE comes from scripts/config.sh.
-for image in "$IMAGE" "$LITELLM_IMAGE" "$NGINX_IMAGE" "$PYTHON_IMAGE"; do
+for image in "$IMAGE" "$CLIPROXY_IMAGE" "$NGINX_IMAGE" "$PYTHON_IMAGE"; do
   docker image inspect "$image" >/dev/null 2>&1 || die "image not prepared: $image"
 done
 [[ "$(prepared_state 2>/dev/null)" == "$(cat "$PREPARED_MARKER" 2>/dev/null)" ]] ||
@@ -47,23 +47,28 @@ if [[ ! -s "$INTERNAL_KEY_FILE" ]]; then
   printf 'sk-%s\n' "$(openssl rand -hex 32)" > "$INTERNAL_KEY_FILE"
 fi
 INTERNAL_KEY=$(tr -d '\r\n' < "$INTERNAL_KEY_FILE")
-[[ "$INTERNAL_KEY" == sk-* ]] || die "LiteLLM internal key must start with sk-"
-export CLIENT_KEY INTERNAL_KEY
+[[ "$INTERNAL_KEY" == sk-* ]] || die "gateway internal key must start with sk-"
+INTERNAL_KEY_JSON=$(jq -Rn --arg key "$INTERNAL_KEY" '$key')
+export CLIENT_KEY INTERNAL_KEY INTERNAL_KEY_JSON
 umask 077
 # shellcheck disable=SC2016 # envsubst receives literal variable names.
 envsubst '${CLIENT_KEY} ${INTERNAL_KEY}' < spark/nginx.conf.template > "$GATEWAY_STATE_DIR/nginx.conf"
+mkdir -p "$GATEWAY_STATE_DIR/cliproxy/empty-auths"
+chmod 700 "$GATEWAY_STATE_DIR/cliproxy" "$GATEWAY_STATE_DIR/cliproxy/empty-auths"
+# shellcheck disable=SC2016
+envsubst '${INTERNAL_KEY_JSON}' < spark/cliproxy.yaml.template > "$GATEWAY_STATE_DIR/cliproxy/config.yaml"
 docker run --rm --network host -v "$GATEWAY_STATE_DIR/nginx.conf:/etc/nginx/nginx.conf:ro" \
   "$NGINX_IMAGE" nginx -t >/dev/null
 
 # The backend starts before the CPU gateway, leaving maximum free RAM for its
 # configured KV allocation. PREPARE=0 rules out a surprise download/build now.
 PREPARE=0 ./start.sh
-docker run -d --name spark-tf-litellm --network host --restart unless-stopped \
-  -e LITELLM_MASTER_KEY="$INTERNAL_KEY" -e LITELLM_MODE=PRODUCTION \
-  -v "$PWD/spark/litellm.yaml:/app/config.yaml:ro" \
-  "$LITELLM_IMAGE" --config /app/config.yaml --host 127.0.0.1 --port 30001 >/dev/null
+docker run -d --name spark-tf-cliproxy --network host --restart unless-stopped \
+  --memory=512m --memory-swap=512m \
+  -v "$GATEWAY_STATE_DIR/cliproxy:/config:ro" \
+  "$CLIPROXY_IMAGE" >/dev/null
 docker run -d --name spark-tf-metrics --network host --restart unless-stopped \
-  -e LITELLM_MASTER_KEY="$INTERNAL_KEY" \
+  -e NATIVE_ENGINE_METRICS=1 \
   -v "$PWD/spark/metrics_bridge.py:/app/metrics_bridge.py:ro" \
   "$PYTHON_IMAGE" python /app/metrics_bridge.py >/dev/null
 docker run -d --name spark-tf-gateway --network host --restart unless-stopped \

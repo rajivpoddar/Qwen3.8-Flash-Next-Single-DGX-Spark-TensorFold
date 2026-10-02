@@ -1,0 +1,142 @@
+diff --git a/tensorfold/cuda/capacity.py b/tensorfold/cuda/capacity.py
+index 333e01f..f8a05c8 100644
+--- a/tensorfold/cuda/capacity.py
++++ b/tensorfold/cuda/capacity.py
+@@ -130,7 +130,8 @@ def estimate_weights(model_dir: str | Path, transform: Callable, *, rank: int |
+         resident += size
+         mapped += host
+         largest = max(largest, size)
+-        match = re.search(r"(?:layers|blocks)\.(\d+)\.", name)
++        # Main, MTP and vision layer zero load independently, not as one layer.
++        match = re.search(r"^(.*?(?:layers|blocks)\.\d+)\.", name)
+         group = match.group(1) if match else name
+         layers[group] = layers.get(group, 0) + size
+     # CPU expert lists/stack, GPU uploads and tiled outputs can coexist during one layer load.
+diff --git a/tensorfold/cuda/streams.py b/tensorfold/cuda/streams.py
+index 07492c8..c28968f 100644
+--- a/tensorfold/cuda/streams.py
++++ b/tensorfold/cuda/streams.py
+@@ -39,6 +39,8 @@ class Stream:
+     min_rows: int = 0
+     drafted: int = 0                                      # drafted rows its rounds verified, and the ones kept
+     accepted: int = 0
++    copy_drafted: int = 0                                 # prompt-lookup rows actually verified, not just proposed
++    copy_accepted: int = 0
+     cached: int = 0
+     prefill_s: float = 0.0
+     started: float = 0.0
+@@ -70,10 +72,13 @@ class Stream:
+         own = {"prefill_s": round(self.prefill_s, 4), "decode_s": round(max(self.finished - self.started, 0.0), 4),
+                "rounds": self.rounds, "drafts": self.draft, "cached": self.cached, "min_rows": self.min_rows,
+                "drafted": self.drafted, "accepted": self.accepted}
++        if self.copies is not None:
++            own.update(copy_drafted=self.copy_drafted, copy_accepted=self.copy_accepted)
+         if self.carry is None:
+             return own
+         both = {k: round(self.carry[k] + own[k], 4) for k in ("prefill_s", "decode_s")}
+         both.update({k: self.carry[k] + own[k] for k in ("rounds", "drafted", "accepted")})
++        both.update({k: self.carry.get(k, 0) + own[k] for k in ("copy_drafted", "copy_accepted") if k in own})
+         rows = [r for r in (self.carry["min_rows"], own["min_rows"]) if r]
+         return {**own, **both, "cached": self.carry["cached"], "min_rows": min(rows, default=0)}
+ 
+diff --git a/tensorfold/families/qwen4_exp/cuda/multi.py b/tensorfold/families/qwen4_exp/cuda/multi.py
+index 86833fd..2bf971b 100644
+--- a/tensorfold/families/qwen4_exp/cuda/multi.py
++++ b/tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import time
+ 
+ import numpy as np
+@@ -30,6 +31,7 @@ GIB = 1024**3
+ SHARE = 0.0                      # --decode-share: a round alone takes this share of its pass's time (0: whole passes)
+ PASS_MIN = 128                   # the fewest prompt rows a round's pass takes
+ FILL_GUARD = 8                   # a prompt passed over this many passes takes the next one (no starvation), as on Macs
++COPY_MATCH = 8                   # prompt lookup needs a matching suffix and a backed continuation
+ 
+ 
+ def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: int, prefill_rows: int) -> Engine:
+@@ -51,6 +53,7 @@ class MultiDecoder:
+         if w.comm is not None:
+             raise ValueError("concurrent Flash Next runs on one GPU for now")
+         self.w, self.depth, self.confidence, self.capacity = w, depth, confidence, capacity
++        self.copy = os.environ.get("TENSORFOLD_MTP_COPY", "0") == "1"
+         self.points = points                         # a prompt's message starts to keep states at, or None
+         self.vision = vision
+         self.eos = tuple(w.cfg.eos) if stop_eos else ()
+@@ -214,6 +217,11 @@ class MultiDecoder:
+             if s.draft and st.image_positions is None and self.points is not None else []
+         s.sid, s.st = self.next_id, st
+         self.next_id += 1
++        s.copy_pending = False
++        if self.copy and mtp:
++            from tensorfold.families.qwen3_5.cuda.decode import CopyIndex
++
++            s.copies = CopyIndex(COPY_MATCH)
+         s.prefill_s = time.perf_counter() - t0
+         same = resume is not None and self._keep_at(s) == begin         # the same prompt again: its own point
+         self.fills[s.sid] = [e, mtp, begin, (resume["state"], resume["tail"]) if same else None]
+@@ -468,6 +476,9 @@ class MultiDecoder:
+             commit(self.w, st, self.buf, a1 - a0, len(path), at=a0, states=False)
+             s.committed.extend(tokens[:len(path)])
+             s.counted(len(tokens))
++            if s.copy_pending:
++                s.copy_drafted += len(tokens) - 1
++                s.copy_accepted += len(path) - 1
+             new = [tokens[r] for r in path[1:]] + [end]
+             if s.constraint is not None:
+                 try:
+@@ -476,7 +487,8 @@ class MultiDecoder:
+                     s.error = exc
+             last = s.error is not None or len(s.out) + len(new) >= s.count or end in self._ends(s)
+             kept.append((s, a0, rows[:len(path)], new, last))
+-        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
++        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last],
++                        {s.sid: new for s, _, _, new, last in kept if s.copies is not None and not last})
+         for s, _, _, new, _ in kept:
+             if s.error is not None:
+                 s.done = True
+@@ -491,11 +503,12 @@ class MultiDecoder:
+             self.held.pop(s.sid, None)
+         return failed + done + ended
+ 
+-    def _draft_all(self, streams: list) -> None:
+-        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth."""
++    def _draft_all(self, streams: list, new: dict | None = None) -> None:
++        """Absorb accepted rows, then use backed prompt copies or chain MTP drafts; every proposal is verified."""
+ 
+         for s, _, _ in streams:
+             s.drafts = []
++            s.copy_pending = False
+         room = {s.sid: min(self.depth, s.count - len(s.out) - len(keep)) for s, _, keep in streams}
+         todo = [(s, a0, keep) for s, a0, keep in streams if room[s.sid] > 0 and self.mbuf is not None]
+         if not todo:
+@@ -511,6 +524,25 @@ class MultiDecoder:
+         for (s, _, keep), (st, a0, a1) in zip(todo, segs):
+             st.set_mtp_len(st.mtp_len + len(keep))
+         active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
++        if new:
++            for s, _ in active:
++                if s.sid not in new:
++                    continue
++                # These tokens are accepted but take() has not appended them yet. Avoid copying the full prompt.
++                old_len = len(s.context)
++                s.context.extend(new[s.sid])
++                try:
++                    s.drafts = s.copies.propose(s.context, max(room[s.sid], COPY_MATCH))[:room[s.sid]]
++                finally:
++                    del s.context[old_len:]
++                s.copy_pending = bool(s.drafts)
++            mtp_rows = [i for i, (s, _) in enumerate(active) if not s.copy_pending]
++            if not mtp_rows:
++                return
++            if len(mtp_rows) != len(active):
++                # MTP emits one logit row per absorbed stream, not per buffer row. Keep each fallback's own row.
++                logits = logits[mtp_rows]
++                active = [active[i] for i in mtp_rows]
+         for j in range(self.depth):
+             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
+             nxt = []

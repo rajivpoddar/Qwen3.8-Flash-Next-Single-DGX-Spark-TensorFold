@@ -1,4 +1,4 @@
-"""Expose live TensorFold tokens and measured gateway E2E latency to the dashboard.
+"""Expose live TensorFold tokens and measured engine or gateway latency.
 
 Never use completed-request token totals as live throughput, or the gateway's
 early role frame as model TTFT. Uninstrumented engine metrics stay absent.
@@ -9,6 +9,7 @@ import math
 import os
 import re
 import threading
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 
@@ -57,6 +58,29 @@ class LiveCounters:
             self.previous[key] = current
             result[key] = self.totals[key]
         return result
+
+    def seed(self, snapshot):
+        # Keep the existing live counters across this gateway-only deployment.
+        for section in ('previous', 'totals'):
+            values = snapshot[section]
+            setattr(self, section, {key: nonnegative(values[key], integer=True) for key in TOKEN_FIELDS})
+
+
+def translate_native(raw: str, health: dict) -> str:
+    """Map only actual engine metrics; health supplies live token totals."""
+    supported = ('e2e_request_latency_seconds', 'time_to_first_token_seconds',
+                 'num_requests_waiting', 'kv_cache_usage_perc',
+                 'spec_decode_num_draft_tokens_total', 'spec_decode_num_accepted_tokens_total',
+                 'preemptions_total')
+    lines = [translate('', health)]
+    for line in raw.splitlines():
+        if any(line.startswith('tensorfold:' + name) or
+               line.startswith('# HELP tensorfold:' + name) or
+               line.startswith('# TYPE tensorfold:' + name) for name in supported):
+            lines.append(line.replace('tensorfold:', 'vllm:') + '\n')
+    # The dashboard accepts both vllm: and vllm_ conventions; retain the
+    # existing bridge convention for consistent model-only reload counters.
+    return ''.join(lines).replace('vllm:', 'vllm_')
 
 
 def translate(raw: str, health: dict) -> str:
@@ -111,8 +135,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         request = Request(
-            "http://127.0.0.1:30001/metrics",
-            headers={"Authorization": "Bearer " + os.environ["LITELLM_MASTER_KEY"]},
+            "http://127.0.0.1:8888/metrics" if os.environ.get('NATIVE_ENGINE_METRICS') == '1' else "http://127.0.0.1:30001/metrics",
+            headers={} if os.environ.get('NATIVE_ENGINE_METRICS') == '1' else {"Authorization": "Bearer " + os.environ["LITELLM_MASTER_KEY"]},
         )
         try:
             with self.scrape_lock:
@@ -125,7 +149,8 @@ class Handler(BaseHTTPRequestHandler):
                         raw = response.read().decode("utf-8", "replace")
                 except OSError as exc:
                     print(f"gateway latency scrape failed: {type(exc).__name__}", flush=True)
-                body = translate(raw, health).encode()
+                mapper = translate_native if os.environ.get('NATIVE_ENGINE_METRICS') == '1' else translate
+                body = mapper(raw, health).encode()
         except (OSError, ValueError, KeyError, TypeError) as exc:
             self.send_error(502, "TensorFold metrics unavailable")
             print(f"metrics scrape failed: {type(exc).__name__}", flush=True)
@@ -141,6 +166,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    if not os.environ.get("LITELLM_MASTER_KEY", "").startswith("sk-"):
+    if os.environ.get('TOKEN_COUNTER_SEED'):
+        Handler.counters.seed(json.loads(Path(os.environ['TOKEN_COUNTER_SEED']).read_text()))
+    if os.environ.get('NATIVE_ENGINE_METRICS') != '1' and not os.environ.get("LITELLM_MASTER_KEY", "").startswith("sk-"):
         raise SystemExit("LITELLM_MASTER_KEY must start with sk-")
     ThreadingHTTPServer(("127.0.0.1", 30002), Handler).serve_forever()

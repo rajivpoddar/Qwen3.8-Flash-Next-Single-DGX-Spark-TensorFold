@@ -58,6 +58,7 @@ class Rows:
 class State:
     def __init__(self):
         self.pos, self.mtp_len, self.mtp_drafted = 30, 12, 2
+        self.image_positions = None
 
     def set_mtp_len(self, n):
         self.mtp_len = n
@@ -96,6 +97,7 @@ def decoder():
     d.mbuf = types.SimpleNamespace(streams=Rows())
     d.buf = types.SimpleNamespace(streams=Rows())
     d.pbuf, d.prefill_rows = None, 2048
+    d.vision, d.points = None, None
     d.calls, d.pick_rows = [], []
 
     def compute(segs):
@@ -203,7 +205,9 @@ class CopyTests(unittest.TestCase):
             d.streams, d.filling, d.fills, d.next_id = {}, [], {}, 0
             d._slot_for = lambda *args: (State(), None, 0)
             d._grow = lambda *args, **kwargs: True
-            with patch.dict(multi_ns, {"_slot": lambda *args: None, "prefill_begin": lambda *args, **kwargs: 0}), \
+            with patch.dict(multi_ns, {"_slot": lambda *args: types.SimpleNamespace(),
+                                      "prefill_begin": lambda *args, **kwargs: 0}), \
+                    patch.dict(multi_ns, {"image_rows": types.SimpleNamespace(begin=lambda *args: None)}), \
                     patch.dict(sys.modules, {fake_copy_module.__name__: fake_copy_module}):
                 d.admit(s)
             self.assertEqual(s.copies is not None, enabled and drafting and depth > 0)

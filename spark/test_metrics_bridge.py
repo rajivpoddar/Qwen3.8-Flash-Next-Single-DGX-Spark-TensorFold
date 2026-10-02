@@ -1,6 +1,6 @@
 import unittest
 
-from metrics_bridge import LiveCounters, translate
+from metrics_bridge import LiveCounters, translate, translate_native
 
 
 def health(prompt=65, completion=10, running=1):
@@ -70,6 +70,31 @@ litellm_in_flight_requests 4
 
 
 class LiveCounterTests(unittest.TestCase):
+    def test_seed_preserves_existing_totals_over_gateway_replacement(self):
+        counters = LiveCounters()
+        counters.seed({'previous': {'prompt_tokens_total': 100, 'completion_tokens_total': 10},
+                       'totals': {'prompt_tokens_total': 1000, 'completion_tokens_total': 200}})
+        observed = counters.observe(health(110, 12))
+        self.assertEqual(observed['prompt_tokens_total'], 1010)
+        self.assertEqual(observed['completion_tokens_total'], 202)
+
+    def test_native_metrics_preserve_real_ttft_and_live_tokens(self):
+        raw = '''# TYPE tensorfold:time_to_first_token_seconds histogram
+tensorfold:time_to_first_token_seconds_sum 20
+tensorfold:time_to_first_token_seconds_count 2
+tensorfold:time_to_first_token_seconds_bucket{le="+Inf"} 2
+tensorfold:e2e_request_latency_seconds_sum 30
+tensorfold:e2e_request_latency_seconds_count 2
+tensorfold:generation_tokens_total 999999
+tensorfold:request_latency_seconds_sum 30
+'''
+        result = translate_native(raw, health(completion=12))
+        self.assertIn('vllm_time_to_first_token_seconds_sum 20', result)
+        self.assertIn('vllm_e2e_request_latency_seconds_sum 30', result)
+        self.assertIn('vllm_generation_tokens_total 12', result)
+        self.assertNotIn('999999', result)
+        self.assertNotIn('vllm_request_latency_seconds_sum', result)
+
     def test_model_reset_does_not_make_dashboard_rates_negative(self):
         counters = LiveCounters()
         self.assertEqual(counters.observe(health(100, 10))["completion_tokens_total"], 10)

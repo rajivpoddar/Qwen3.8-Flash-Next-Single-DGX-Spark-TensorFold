@@ -2,8 +2,8 @@
 
 This fork preserves the existing `qwen3.8-flash-next` client alias and the
 client-facing `:30000` URL. TensorFold runs privately on `127.0.0.1:8888`.
-LiteLLM translates Claude Code's Anthropic `/v1/messages` requests to
-TensorFold's private OpenAI chat API; LiteLLM listens on `127.0.0.1:30001`,
+CLIProxyAPI v8.0.10 translates Claude Code's Anthropic `/v1/messages` requests to
+TensorFold's private OpenAI chat API; it listens on `127.0.0.1:30001`,
 and nginx retains the existing client
 key on `:30000`. No slot launcher or client key needs changing. The existing
 Spark dashboard keeps pointing at `http://192.168.68.113:30000` and its current
@@ -11,28 +11,29 @@ provider key. Its `/health` and `/v1/models` probes resolve the new model.
 
 The small metrics bridge maps TensorFold's live emitted-token counter and
 prompt counter into the names the dashboard's vLLM adapter reads. Never use
-LiteLLM's completed-response token totals for live throughput: that creates
+completed-response token totals for live throughput: that creates
 zeroes during generation and a large fake burst at completion. The running
-gauge also comes from TensorFold health, not LiteLLM's all-HTTP gauge.
+gauge also comes from TensorFold health, not a gateway's all-HTTP gauge.
 Token totals retain the observed count across engine reloads for this bridge
 process's lifetime. Restart the dashboard together with a bridge restart to
 clear its counter baselines and historical averages. Prompt totals still update
 at first output, so the prompt-rate chart is admission accounting, not measured
 instantaneous prefill speed (and includes cached prompt tokens).
 
-Gateway end-to-end latency sum/count and histogram buckets are mapped to E2E;
-they measure complete gateway requests, including prefill and streaming.
-Gateway first-frame latency is not mapped to TTFT because the role frame arrives
-before prefill. True model TTFT, TPOT, ITL, batch, KV, queue and speculation
-metrics remain unavailable until the engine instruments them; do not interpret
-them as zero. This is dashboard compatibility, **not** vLLM instrumentation.
+With `NATIVE_ENGINE_METRICS=1`, the bridge scrapes TensorFold 0.6.1's native
+`/metrics` directly, without gateway credentials or a LiteLLM dependency. It maps
+the measured model TTFT and engine E2E histograms, queue, KV occupancy, MTP
+draft/acceptance totals and preemptions. Engine E2E excludes translation and
+network transit. TPOT, ITL and batch remain absent rather than fabricated. This
+is dashboard compatibility, **not** vLLM instrumentation. A migration-only
+`TOKEN_COUNTER_SEED` JSON file can preserve the previous bridge's observed live
+token counters when replacing it; it is not required for a fresh stack.
 
 For a telemetry-only repair, back up the remote bridge file, transfer the new
 bridge, run its unit tests on the host, and restart only `spark-tf-metrics` and
 `spark-dashboard`. Do not restart the model or gateway and do not move slots.
-The dashboard must have `SPARK_WARMUP_SKIP_REQUESTS=0` for this partial-metrics
-backend: its default warmup gate otherwise waits forever for a model TTFT
-histogram count that TensorFold does not export. Preserve the rest of the
+Older engines without TTFT must have `SPARK_WARMUP_SKIP_REQUESTS=0`; this is
+already set on the live dashboard. TensorFold 0.6.1 does export TTFT. Preserve the rest of the
 dashboard's container configuration and state volume when setting this flag.
 Prove advancing token counters while a response is still streaming and verify
 the corresponding WebSocket throughput and E2E values; connectivity alone is
@@ -40,6 +41,55 @@ not a chart-correctness proof. Restore the saved bridge and restart those same
 two telemetry containers if proof fails.
 
 ## Preparation and cutover
+
+### CLIProxyAPI gateway (October 2)
+
+The live route is nginx `:30000` → CLIProxyAPI `127.0.0.1:30001` → TensorFold
+`127.0.0.1:8888`. The old `spark-tf-litellm` is stopped and retained for rollback;
+it is not serving or loading another model. No Mac CLIProxy instance, slot
+launcher, client key, MoP process or conversation was changed.
+
+Prepare the CPU-only gateway image on the Spark with:
+
+```sh
+bash spark/prepare-cliproxy.sh
+```
+
+This downloads the official Linux/aarch64 no-plugin v8.0.10 archive and checks
+SHA256 `fa776f18c4ce486a6d3eaf68ea9d1337bee1865d116b0e3b4d05a5d9c36af2bc`
+before building `spark/Dockerfile.cliproxy`. The deployed image ID is
+`sha256:822a2ddf3c5f777b368439a82805d6ea05141dfe6bb57da8fa4a5677be71f3b6`.
+This local ID may differ on a rebuild; do not substitute an unverified binary.
+
+`spark/cliproxy.yaml.template` uses the existing private gateway key, declares
+the upstream text-only, disables management and request logging, and stores no
+OAuth credentials. It explicitly disables Claude model-list cloaking, so both
+Anthropic and OpenAI model discovery return `qwen3.8-flash-next`. Retries stay
+off; streaming keepalive is 15 seconds. The live container is capped at 512 MiB
+without extra swap and uses `unless-stopped`.
+
+The built-in text-only guard replaces **tool-returned** images with
+`[image omitted: unsupported by upstream]`, preserving adjacent text and tool
+IDs. It never turns screenshot base64 into ordinary prompt text. This does not
+provide visual understanding: direct image/video prompts remain unsupported.
+The live single-image history proof used 349 input tokens despite one million
+base64 characters; Anthropic replies, reasoning/text SSE, xhigh tool arguments,
+wrong-key rejection and the native dashboard metrics passed.
+
+`start-stack.sh` now creates CLIProxyAPI and the native metrics bridge for a
+**fresh, prepared** stack. Do not run it over the live Tinfield services or
+preserved rollback containers. For an existing stack, interrupt only active
+requests, preserve/stop the exact old gateway, start the prepared CLIProxyAPI
+container with the private config mounted read-only, and prove the public
+Anthropic route before resuming existing conversations sequentially. If proof
+fails, stop only CLIProxyAPI and start the retained LiteLLM gateway. Both bind
+the same private port and must never run together. If reverting telemetry too,
+stop the new bridge and restore the retained
+`spark-tf-metrics-litellm-rollback-20261002` container under its canonical name.
+
+Upstream: [release](https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.10),
+[configuration](https://github.com/router-for-me/CLIProxyAPI/blob/v8.0.10/config.example.yaml),
+[tool-image guard](https://github.com/router-for-me/CLIProxyAPI/blob/v8.0.10/internal/runtime/executor/helps/openai_compat_tool_results.go).
 
 ### TensorFold 0.6.0 prompt-copy drafting (Victoria NVFP4)
 
@@ -71,6 +121,129 @@ decode share .20. Do not replay the older 0.3.x maintenance scripts over this
 existing conversations after authenticated Anthropic streaming/tool proof.
 
 Source: [Mia's prompt-copy patch](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/main/patches/0007-flash-next-copy-drafts.patch).
+
+### Tinfield-1 EXL3 on TensorFold 0.6.1
+
+`spark/tinfield.py` is a separate, text-only profile for
+[khronnuz/Tinfield-1-exl3](https://huggingface.co/khronnuz/Tinfield-1-exl3/tree/4.05bpw_h6_ng6),
+the EXL3 conversion of `badtheorylabs/Tinfield-1` (Flash Next, not dense 27B).
+The 4.05-bpw / 6-bit-head / 6-bit-ngram branch is pinned to
+`460f8565373f20e1c172f72f261f591e4f76b8a4` in `spark/tinfield-exl3.json`.
+Do not pull the repo's `main`: that branch has no serving weights.
+
+The profile pins the separately built TensorFold 0.6.1 image
+`sha256:21bd28447c82904c0593075f3c29c59eed30500923ea29feb38df62384706c0a`.
+This is a **local Spark image ID**, not an image available from a registry.
+It uses upstream `v0.6.1` at `17c73e189f5e6a5304cda7ea37f086f9c49b4788`,
+retaining the scoped loading estimate and verified prompt-copy changes in
+`spark/patches/tf061-tinfield.patch`. No ExLlama runtime is required.
+`runtime` checks the installed family,
+n-gram loader and copy patch in an offline CPU-only container.
+
+Run these commands **on the Spark** from the recipe checkout:
+
+```sh
+python3 spark/test_tinfield.py
+python3 spark/tinfield.py runtime
+python3 spark/tinfield.py prepare
+python3 spark/tinfield.py status
+docker logs --tail 30 tinfield-flash-next-tf060-copy-v1-download
+python3 spark/tinfield.py check
+python3 spark/tinfield.py command
+```
+
+`prepare` starts one named Docker download worker, without a GPU,
+limited to 512 MiB RAM, no additional swap, two CPUs and one download worker.
+Xet and HF Transfer are disabled; the exact revision is downloaded over HTTP.
+Restarting reuses completed cached files; HTTP transient retries can resume the
+current transfer, but HF 1.24 does not retain byte-resume state across restarts.
+The ~100.1 GiB pack includes nine weight shards and a separate ~36.4 GiB n-gram
+file, plus its own tokenizer/template and metadata. That extra file is required
+even though it is absent from the main weight index. Its 128 six-bit segments
+are packed into one file. Do not substitute Victoria's PLE or MTP weights.
+`prepare` does not auto-retry an OOM or stop/remove any existing container.
+The completed download container and logs remain available for inspection.
+
+`check` rejects partial/wrong-size files, wrong HF blob identities, corrupt
+critical LFS metadata, wrong architecture/quantization, missing MTP keys and
+invalid table geometry. It then calculates header-only memory estimates using
+the actual installed engine in a CPU-only container capped at 2 GiB. It does
+not hash every weight byte, load a model, or claim GPU inference is validated.
+Its full-four-window estimate is separate from the stock startup estimate:
+the engine admits one full window initially and grows other streams subject to
+its memory gate. Mapped n-gram pages are reclaimable and may page from SSD if
+memory becomes tight. Four configured slots are not proof that four maximum
+contexts plus the whole table remain resident. The stock memory guard stays on.
+
+The future launch command keeps private `127.0.0.1:8888`, the public gateway's
+existing `:30000` route, `qwen3.8-flash-next` alias, four slots, 262144 context,
+INT4 KV, MTP4/confidence .60, thinking, prompt-copy and decode share .20.
+Neither `--ple-on-ssd` nor `--prefill-fp8` is valid for EXL3; both are omitted.
+Image/video serving remains off. The backend itself does not require gateway
+or dashboard changes; the separate October 2 CLIProxyAPI migration above is
+already live.
+
+The October 2 draft-depth trial changes only MTP3 to MTP4, using the separately
+named `tinfield-flash-next-tf060-copy-mtp4-v1` container. The original
+`tinfield-flash-next-tf060-copy-v1` stays stopped as the exact MTP3 rollback.
+Matched 72,097-token cached prompts (three repeats, greedy and sampled, one
+and two streams) showed only a modest 1.3–2.8% median per-request decode gain;
+all output token hashes matched. This is a bounded synthetic result, not a
+claim of a large speedup or four simultaneously full 262K contexts. That first
+trial did not include a runtime or scheduler change.
+
+The subsequent October 2 update uses the separately named
+`tinfield-flash-next-tf061-copy-mtp4-share20-v1` container. Its immediate rollback
+is the preserved `tinfield-flash-next-tf060-copy-mtp4-v1` container. Keep both old
+containers; do not remove or restart them while the new backend serves.
+`decode_share` is explicit in the JSON profile. A same-version .30 trial did not
+improve the bounded four-client mixed workload: .20 finished in 35.11 s versus
+38.37 s at .30, with identical output hashes; the largest streaming gap was
+2.81 s versus 4.55 s. These are single synthetic runs, not production-wide
+performance guarantees. Keep .20; the stopped .30 trial remains available for
+inspection. Raising the share is intended to give decode more scheduler time
+during concurrent prefill, not a 50% increase in standalone tokens/second.
+v0.6.1 also introduces
+shared kept prefixes and short-prompt-first scheduling on CUDA Flash Next.
+The larger idle prompt workspace in this release excludes EXL3, so do not
+advertise that path as active for Tinfield.
+
+The later same-image .10 trial also showed no useful gain. In a matched
+four-client workload, .20 took 34.30 s and .10 took 35.46 s. The uncached
+14,349-token request took 20.52 s and 20.48 s respectively (engine prefill
+14.90 s and 14.87 s), with identical output hashes throughout. Maximum
+streaming gaps were 2.81 s and 2.84 s. Keep .20: a ~0.2% cold-request difference
+is not a meaningful improvement, while overall time was ~3.4% worse. These
+are single bounded synthetic runs, not long-context production guarantees.
+The .10 container is stopped and retained with restart disabled. The original
+.20 container is serving again with its unchanged `unless-stopped` policy;
+only the separate CLIProxyAPI/metrics migration was retained.
+
+Rebuild with `spark/Dockerfile.tinfield-tf061` after verifying the base image is
+`sha256:2c318ce3dd7fdee5d1fac9d684382f5ecd444d2c3aefd7484aba7af5ac4f3f4b`.
+Pass the SHA256 of `spark/patches/tf061-tinfield.patch` as `PATCH_SHA256`, then
+replace the profile image ID with the verified local result. The active trial
+was built from that exact upstream checkout plus those three changed files,
+using the same retained CUDA/PyTorch stack. Slots stay on Sol during validation;
+do not return them to DGX without a separate request.
+
+**Preparation is not cutover.** Only after a separately authorized cutover has
+moved affected clients off Spark and preserved/stopped the source backend:
+
+```sh
+python3 spark/tinfield.py start
+```
+
+`start` checks the pack and refuses if port 8888 is occupied or the Tinfield
+container already exists. It never stops Victoria, removes a rollback, moves
+slots or rebuilds the gateway. The new backend uses `unless-stopped` for boot
+restart. Before returning clients, prove actual GPU loading, MTP acceptance,
+four concurrent text requests, authenticated Anthropic streaming/tool turns
+and advancing dashboard counters. If proof fails, stop only the new backend
+and restore the preserved source under the normal cutover procedure. Do not
+run the older root `start.sh`, `prepare.sh` or `start-stack.sh` over this stack.
+
+Runtime support: [TensorFold EXL3 recipe](https://github.com/ashhart/TensorFold/blob/main/docs/recipes/exl3.md).
 
 ### Retaining a reusable prefix after warm requests
 
